@@ -6,7 +6,7 @@ set -e
 log() {
     echo "[$(date -Is)] [$CONTAINER_ID] $*"
 }
-while read DOCKER_EVENT; do
+while read -r DOCKER_EVENT; do
     # docker events
     CONTAINER_ID=$(echo "$DOCKER_EVENT" | cut -d' ' -f4)
     if [ -z "$CONTAINER_ID" ]; then
@@ -39,45 +39,74 @@ while read DOCKER_EVENT; do
     if [[ "$NETWORK_NAMES" == *"\n"* ]]; then
         log "Warning: Container is connected to multiple networks"
     fi
-    while read NETWORK_NAME; do
+    while read -r NETWORK_NAME; do
         NETWORK_INTERFACE_NAMES=$(docker_container_interfaces_in_network "$CONTAINER_ID" "$NETWORK_NAME")
-        if [ -z "$NETWORK_INTERFACE_NAMES" ]; then
+        if [ -n "${NETWORK_INTERFACE_NAMES}" ]; then
+            while IFS= read -r NETWORK_INTERFACE_NAME; do
+                if [ -n "${NETWORK_INTERFACE_NAME}" ]; then
+                    LIMIT=$(docker_container_labels_get "$BASE_LABEL.limit")
+                    DELAY=$(docker_container_labels_get "$BASE_LABEL.delay")
+                    LOSS=$(docker_container_labels_get "$BASE_LABEL.loss")
+                    CORRUPT=$(docker_container_labels_get "$BASE_LABEL.corrupt")
+                    DUPLICATION=$(docker_container_labels_get "$BASE_LABEL.duplicate")
+                    REORDERING=$(docker_container_labels_get "$BASE_LABEL.reorder")
+                    tc_init
+                    qdisc_del "$NETWORK_INTERFACE_NAME" &>/dev/null || true
+                    OPTIONS_LOG=
+                    NETM_OPTIONS=
+                    CONTROLLING="false"
+                    netm_add_rule() {
+                        if [ -n "$2" ]; then
+                            OPTIONS_LOG+="$3=$2, "
+                            NETM_OPTIONS+="$1 $2 "
+                        fi
+                    }
+                    if [ -n "${DELAY}" ]; then
+                        netm_add_rule "delay" "$DELAY" "delay"
+                        CONTROLLING="true"
+                    fi
+                    if [ -n "${LOSS}" ]; then
+                        netm_add_rule "loss random" "$LOSS" "loss"
+                        CONTROLLING="true"
+                    fi
+                    if [ -n "${CORRUPT}" ]; then
+                        netm_add_rule "corrupt" "$CORRUPT" "corrupt"
+                        CONTROLLING="true"
+                    fi
+                    if [ -n "${DUPLICATION}" ]; then
+                        netm_add_rule "duplicate" "$DUPLICATION" "duplicate"
+                        CONTROLLING="true"
+                    fi
+                    if [ -n "${REORDERING}" ]; then
+                        netm_add_rule "reorder" "$REORDERING" "reorder"
+                        CONTROLLING="true"
+                    fi
+                    if [ -n "${OPTIONS_LOG}" ]; then
+                        OPTIONS_LOG=$(echo "$OPTIONS_LOG" | sed 's/[, ]*$//')
+                        log "Set ${OPTIONS_LOG} on ${NETWORK_INTERFACE_NAME}"
+                    fi
+                    if [ -n "${NETM_OPTIONS}" ] && [ -n "${NETM_OPTIONS}" ]; then
+                        qdisc_netm "$NETWORK_INTERFACE_NAME" "${NETM_OPTIONS}"
+                        CONTROLLING="true"
+                    fi
+                    if [ -n "$LIMIT" ] && [ -n "${NETWORK_INTERFACE_NAME}" ]; then
+                        log "Set bandwidth-limit=$LIMIT on $NETWORK_INTERFACE_NAME"
+                        qdisc_tbf "$NETWORK_INTERFACE_NAME" rate "$LIMIT"
+                        CONTROLLING="true"
+                    fi
+                    lock "$CONTAINER_ID"
+                    if [ "${CONTROLLING}" = "true" ]; then
+                        log "Controlling traffic of the container $(docker_container_get_name "$CONTAINER_ID") on $NETWORK_INTERFACE_NAME"
+                    fi
+                else
+                    continue
+                fi
+            done < <(echo -e "$NETWORK_INTERFACE_NAMES")
+        else
             log "Warning: Network has no corresponding virtual network interface"
             lock "$CONTAINER_ID"
             continue
         fi
-        while IFS= read -r NETWORK_INTERFACE_NAME; do
-            LIMIT=$(docker_container_labels_get "$BASE_LABEL.limit")
-            DELAY=$(docker_container_labels_get "$BASE_LABEL.delay")
-            LOSS=$(docker_container_labels_get "$BASE_LABEL.loss")
-            CORRUPT=$(docker_container_labels_get "$BASE_LABEL.corrupt")
-            DUPLICATION=$(docker_container_labels_get "$BASE_LABEL.duplicate")
-            REORDERING=$(docker_container_labels_get "$BASE_LABEL.reorder")
-            tc_init
-            qdisc_del "$NETWORK_INTERFACE_NAME" &>/dev/null || true
-            OPTIONS_LOG=
-            NETM_OPTIONS=
-            netm_add_rule() {
-                if [ ! -z "$2" ]; then
-                    OPTIONS_LOG+="$3=$2, "
-                    NETM_OPTIONS+="$1 $2 "
-                fi
-            }
-            netm_add_rule "delay" "$DELAY" "delay"
-            netm_add_rule "loss random" "$LOSS" "loss"
-            netm_add_rule "corrupt" "$CORRUPT" "corrupt"
-            netm_add_rule "duplicate" "$DUPLICATION" "duplicate"
-            netm_add_rule "reorder" "$REORDERING" "reorder"
-            OPTIONS_LOG=$(echo "$OPTIONS_LOG" | sed 's/[, ]*$//')
-            log "Set ${OPTIONS_LOG} on $NETWORK_INTERFACE_NAME"
-            qdisc_netm "$NETWORK_INTERFACE_NAME" $NETM_OPTIONS
-            if [ ! -z "$LIMIT" ]; then
-                log "Set bandwidth-limit=$LIMIT on $NETWORK_INTERFACE_NAME"
-                qdisc_tbf "$NETWORK_INTERFACE_NAME" rate "$LIMIT"
-            fi
-            lock "$CONTAINER_ID"
-            log "Controlling traffic of the container $(docker_container_get_name "$CONTAINER_ID") on $NETWORK_INTERFACE_NAME"
-        done < <(echo -e "$NETWORK_INTERFACE_NAMES")
     done < <(echo -e "$NETWORK_NAMES")
 done < <(
     docker ps -q;
